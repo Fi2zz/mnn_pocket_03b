@@ -51,6 +51,11 @@ abstract class OnenmLocalLlmPlatform extends PlatformInterface {
     throw UnimplementedError('generate() has not been implemented.');
   }
 
+  /// Requests cancellation of the current generation.
+  Future<void> cancelGenerate() {
+    throw UnimplementedError('cancelGenerate() has not been implemented.');
+  }
+
   /// Releases all native resources (model, context, backend).
   Future<void> releaseModel() {
     throw UnimplementedError('releaseModel() has not been implemented.');

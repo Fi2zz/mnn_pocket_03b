@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:onenm_local_llm/onenm_local_llm.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
@@ -14,8 +16,10 @@ const bool _autoSmoke = bool.fromEnvironment('AUTO_SMOKE');
 /// Optional routing evaluation: `flutter run --dart-define=AUTO_EVAL=true`.
 const bool _autoEval = bool.fromEnvironment('AUTO_EVAL');
 
-/// Optional ASR self-test: `flutter run --dart-define=AUTO_ASR=true`.
-const bool _autoAsr = bool.fromEnvironment('AUTO_ASR');
+const MethodChannel _deviceInfoChannel = MethodChannel('device_info');
+
+/// Optional streaming ASR self-test: `flutter run --dart-define=AUTO_STREAM=true`.
+const bool _autoStream = bool.fromEnvironment('AUTO_STREAM');
 
 const String _systemPrompt =
     '你是 MNN-Pocket，一个完全运行在手机本地的 AI 助手。回答简洁、准确，优先使用用户的语言。';
@@ -47,12 +51,12 @@ const GenerationSettings _defaultSettings = GenerationSettings(
   temperature: 0.4,
   topK: 20,
   topP: 0.8,
-  maxTokens: 256,
+  maxTokens: 768,
   repeatPenalty: 1.1,
 );
 
 const List<String> _suggestions = <String>[
-  '用一句话介绍你自己',
+  '用 Rust 写一个斐波那契函数，带注释',
   '把「我要退款」分类到：退款/物流/咨询/投诉，只输出标签',
   '从评论抽取属性和情感：包装很好，但遮瑕效果差一些',
 ];
@@ -173,6 +177,9 @@ class _ChatPageState extends State<ChatPage> {
   double? _progress;
   bool _initializing = false;
   bool _busy = false;
+  bool _stopRequested = false;
+  String? _deviceLabel;
+  String? _deviceDetail;
   bool _smokeDone = false;
 
   int _tab = 0;
@@ -186,9 +193,17 @@ class _ChatPageState extends State<ChatPage> {
   sherpa_onnx.OnlineRecognizer? _asr;
   sherpa_onnx.VoiceActivityDetector? _vad;
   bool _asrLoading = false;
-  bool _recording = false;
-  bool _transcribing = false;
-  Timer? _recordTimer;
+
+  bool _streaming = false;
+  bool _inputModeVoice = false;
+  StreamSubscription<Uint8List>? _streamSub;
+  sherpa_onnx.OnlineStream? _liveStream;
+  String _livePartial = '';
+  final List<String> _liveFinals = <String>[];
+  final List<double> _pcmPending = <double>[];
+  bool _vadSpeaking = false;
+  int _silenceChunks = 0;
+  DateTime _lastLiveUi = DateTime.fromMillisecondsSinceEpoch(0);
 
   final TextEditingController _evalInput = TextEditingController();
   bool _evaluating = false;
@@ -205,9 +220,51 @@ class _ChatPageState extends State<ChatPage> {
   void initState() {
     super.initState();
     _messages.add(_welcome());
+    _loadDeviceInfo();
     _evalInput.text =
         _defaultEvalCases.map((c) => '${c.query}\t${c.expected}').join('\n');
     _bootstrap();
+  }
+
+  Future<void> _loadDeviceInfo() async {
+    debugPrint('[DEVICE] start');
+    try {
+      if (Platform.isAndroid) {
+        final map =
+            await _deviceInfoChannel.invokeMapMethod<String, dynamic>('get');
+        debugPrint('[DEVICE] map=$map');
+        if (map == null) return;
+        final soc = (map['soc'] as String?)?.trim() ?? '';
+        final ramBytes = (map['ramBytes'] as num?)?.toDouble() ?? 0;
+        final ramGB = (ramBytes / (1024 * 1024 * 1024)).toStringAsFixed(1);
+        final cores = map['cores'];
+        final android = (map['android'] as String?)?.trim() ?? '';
+        final parts = <String>[
+          if (soc.isNotEmpty && soc != 'unknown') soc,
+          if (ramBytes > 0) '${ramGB}GB',
+        ];
+        final compact = parts.join(' · ');
+        final detailParts = <String>[
+          ...parts,
+          if (cores != null) '$cores 核',
+          if (android.isNotEmpty) 'Android $android',
+        ];
+        if (!mounted) return;
+        setState(() {
+          _deviceLabel = compact;
+          _deviceDetail = detailParts.join(' · ');
+        });
+        debugPrint('[DEVICE] $_deviceDetail');
+      } else {
+        if (!mounted) return;
+        setState(() {
+          _deviceLabel = Platform.operatingSystem;
+          _deviceDetail = Platform.operatingSystem;
+        });
+      }
+    } catch (e) {
+      debugPrint('[DEVICE] info failed: $e');
+    }
   }
 
   _Message _welcome() => _Message(
@@ -289,8 +346,8 @@ class _ChatPageState extends State<ChatPage> {
         _evalDone = true;
         unawaited(_runEval());
       }
-      if (_autoAsr) {
-        unawaited(_runAsrSelfTest());
+      if (_autoStream) {
+        unawaited(_runStreamSelfTest());
       }
     } catch (e) {
       unawaited(ai.dispose());
@@ -362,13 +419,21 @@ class _ChatPageState extends State<ChatPage> {
     return text.trim();
   }
 
+  Future<void> _stopGeneration() async {
+    final ai = _ai;
+    if (ai == null || !_busy) return;
+    _stopRequested = true;
+    await ai.cancelGenerate();
+  }
+
   Future<void> _send([String? preset]) async {
     final ai = _ai;
-    if (ai == null || _busy || _evaluating) return;
+    if (ai == null || _busy || _evaluating || _streaming) return;
     final text = (preset ?? _input.text).trim();
     if (text.isEmpty) return;
 
     _input.clear();
+    _stopRequested = false;
     setState(() {
       _messages.add(_Message('user', text));
       _messages.add(_Message('assistant', ''));
@@ -384,8 +449,15 @@ class _ChatPageState extends State<ChatPage> {
       if (!mounted) return;
       setState(() {
         _messages.last.text = clean.isEmpty ? '（模型没有返回内容）' : clean;
+        final device = _deviceLabel == null ? '' : '$_deviceLabel · ';
+        final gen = _settings;
+        final genText =
+            'T=${gen.temperature.toStringAsFixed(2)} · top_p=${gen.topP.toStringAsFixed(2)}'
+            ' · top_k=${gen.topK} · max=${gen.maxTokens}'
+            ' · repeat=${gen.repeatPenalty.toStringAsFixed(2)}';
         _messages.last.meta =
-            '${(stopwatch.elapsedMilliseconds / 1000).toStringAsFixed(2)}s · ${clean.length} 字';
+            '$device${(stopwatch.elapsedMilliseconds / 1000).toStringAsFixed(2)}s · ${clean.length} 字'
+            '${_stopRequested ? ' · 已停止' : ''}\n$genText';
       });
       if (_autoSmoke) {
         debugPrint(
@@ -411,18 +483,548 @@ class _ChatPageState extends State<ChatPage> {
     await _send('用一句话介绍你自己');
   }
 
-  Future<void> _runAsrSelfTest() async {
+  Future<void> _toggleStreaming() async {
+    if (_streaming) {
+      await _stopStreaming();
+      return;
+    }
+    if (_busy || _evaluating || _asrLoading) {
+      return;
+    }
+    final asr = await _ensureAsr();
+    if (asr == null) return;
+    if (!await _recorder.hasPermission()) {
+      _showSnack('需要麦克风权限');
+      return;
+    }
+    _pcmPending.clear();
+    _liveFinals.clear();
+    _livePartial = '';
+    _vadSpeaking = false;
+    _silenceChunks = 0;
+    _lastLiveUi = DateTime.fromMillisecondsSinceEpoch(0);
+    _liveStream = asr.createStream();
+    try {
+      final stream = await _recorder.startStream(
+        const RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: 16000,
+          numChannels: 1,
+          echoCancel: true,
+          noiseSuppress: true,
+          autoGain: true,
+        ),
+      );
+      if (!mounted) return;
+      setState(() => _streaming = true);
+      _streamSub = stream.listen(
+        _onPcm,
+        onError: (Object e) {
+          _showSnack('实时录音错误：$e');
+          unawaited(_stopStreaming(apply: false));
+        },
+        onDone: () {
+          if (_streaming) unawaited(_stopStreaming());
+        },
+      );
+    } catch (e) {
+      _liveStream?.free();
+      _liveStream = null;
+      _showSnack('实时录音启动失败：$e');
+    }
+  }
+
+  void _onPcm(Uint8List bytes) {
+    if (bytes.length < 2) return;
+    final data = ByteData.sublistView(bytes);
+    for (var i = 0; i + 1 < bytes.length; i += 2) {
+      _pcmPending.add(data.getInt16(i, Endian.little) / 32768.0);
+    }
+    while (_pcmPending.length >= 512) {
+      final chunk = Float32List.fromList(_pcmPending.sublist(0, 512));
+      _pcmPending.removeRange(0, 512);
+      _processLiveChunk(chunk);
+    }
+  }
+
+  void _processLiveChunk(Float32List chunk) {
+    final asr = _asr;
+    final live = _liveStream;
+    if (asr == null || live == null) return;
+
+    var speaking = _vadSpeaking;
+    final vad = _vad;
+    if (vad != null) {
+      vad.acceptWaveform(chunk);
+      speaking = vad.isDetected();
+      while (!vad.isEmpty()) {
+        vad.pop();
+      }
+    }
+
+    live.acceptWaveform(samples: chunk, sampleRate: 16000);
+    while (asr.isReady(live)) {
+      asr.decode(live);
+    }
+    final text = asr.getResult(live).text.trim();
+    var changed = false;
+    if (text != _livePartial) {
+      _livePartial = text;
+      changed = true;
+    }
+    if (speaking != _vadSpeaking) {
+      _vadSpeaking = speaking;
+      changed = true;
+    }
+    if (speaking) {
+      _silenceChunks = 0;
+    } else {
+      _silenceChunks++;
+    }
+    final vadEndpoint =
+        !speaking && _silenceChunks >= 25 && _livePartial.isNotEmpty;
+    if (asr.isEndpoint(live) || vadEndpoint) {
+      if (_livePartial.isNotEmpty) {
+        _liveFinals.add(_livePartial);
+        _livePartial = '';
+      }
+      asr.reset(live);
+      _silenceChunks = 0;
+      changed = true;
+    }
+    if (changed) _updateLiveUi();
+  }
+
+  void _updateLiveUi({bool force = false}) {
+    final now = DateTime.now();
+    if (!force && now.difference(_lastLiveUi).inMilliseconds < 120) {
+      return;
+    }
+    _lastLiveUi = now;
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  void _flushLiveTail() {
+    final asr = _asr;
+    final live = _liveStream;
+    if (asr == null || live == null) return;
+    const padSamples = 16000; // 1.0 s of silence so the tail is emitted
+    live.acceptWaveform(
+      samples: Float32List(padSamples),
+      sampleRate: 16000,
+    );
+    live.inputFinished();
+    while (asr.isReady(live)) {
+      asr.decode(live);
+    }
+    final text = asr.getResult(live).text.trim();
+    if (text.isNotEmpty) _livePartial = text;
+    final tail = _livePartial.trim();
+    if (tail.isNotEmpty) {
+      _liveFinals.add(tail);
+      _livePartial = '';
+    }
+    asr.reset(live);
+    _silenceChunks = 0;
+  }
+
+  Future<String?> _stopStreaming({bool apply = true}) async {
+    if (!_streaming) return null;
+    _streamSub?.cancel();
+    _streamSub = null;
+    try {
+      await _recorder.stop();
+    } catch (_) {}
+    _flushLiveTail();
+    final text = [
+      ..._liveFinals,
+      if (_livePartial.trim().isNotEmpty) _livePartial.trim(),
+    ].join(' ');
+    _liveStream?.free();
+    _liveStream = null;
+    _pcmPending.clear();
+    if (!mounted) return null;
+    setState(() {
+      _streaming = false;
+      _livePartial = '';
+      _liveFinals.clear();
+      _vadSpeaking = false;
+      _silenceChunks = 0;
+    });
+    if (apply) {
+      if (text.isEmpty) {
+        _showSnack('没有识别到文字');
+      } else {
+        _applyTranscript(text);
+      }
+    }
+    return text;
+  }
+
+  Future<void> _runStreamSelfTest() async {
     await Future<void>.delayed(const Duration(milliseconds: 800));
     if (!mounted) return;
     final support = await getApplicationSupportDirectory();
     final file = File('${support.path}/asr/test.wav');
     if (!await file.exists()) {
-      debugPrint('[ASR] test.wav not found at ${file.path}');
+      debugPrint('[STREAM] test.wav not found');
       return;
     }
     final asr = await _ensureAsr();
     if (asr == null) return;
-    await _transcribe(file.path);
+    final wave = sherpa_onnx.readWave(file.path);
+    if (wave.samples.isEmpty) return;
+    _liveStream = asr.createStream();
+    _liveFinals.clear();
+    _livePartial = '';
+    _pcmPending.clear();
+    _silenceChunks = 0;
+    setState(() => _streaming = true);
+    final sw = Stopwatch()..start();
+    const window = 512;
+    for (var i = 0; i < wave.samples.length; i += window) {
+      final end = (i + window).clamp(0, wave.samples.length);
+      _processLiveChunk(wave.samples.sublist(i, end));
+    }
+    _flushLiveTail();
+    final finals = [
+      ..._liveFinals,
+      if (_livePartial.trim().isNotEmpty) _livePartial.trim(),
+    ];
+    debugPrint(
+      '[STREAM] segments=${finals.length} text=${finals.join(' ')} (${sw.elapsedMilliseconds}ms)',
+    );
+    _liveStream?.free();
+    _liveStream = null;
+    if (mounted) setState(() => _streaming = false);
+    _liveFinals.clear();
+    _livePartial = '';
+    _pcmPending.clear();
+    if (finals.isNotEmpty) _applyTranscript(finals.join(' '));
+  }
+
+  Widget _livePanel(BuildContext context) {
+    if (!_streaming) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    final text = [
+      ..._liveFinals,
+      if (_livePartial.trim().isNotEmpty) _livePartial.trim(),
+    ].join(' ');
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: scheme.primaryContainer,
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                _vadSpeaking ? Icons.mic : Icons.mic_none,
+                size: 16,
+                color: scheme.onPrimaryContainer,
+              ),
+              const SizedBox(width: 6),
+              Text(
+                _vadSpeaking ? '正在说话…' : '等待语音…',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: scheme.onPrimaryContainer,
+                ),
+              ),
+              const Spacer(),
+              Text(
+                '${_liveFinals.length} 段',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: scheme.onPrimaryContainer.withValues(alpha: 0.8),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 140),
+            child: SingleChildScrollView(
+              child: SelectableText(
+                text.isEmpty ? '…' : text,
+                style: TextStyle(
+                  fontSize: 13,
+                  height: 1.5,
+                  color: scheme.onPrimaryContainer,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _toggleInputMode() async {
+    if (_streaming) {
+      await _stopStreaming();
+    }
+    if (!mounted) return;
+    setState(() => _inputModeVoice = !_inputModeVoice);
+    FocusScope.of(context).unfocus();
+    if (_inputModeVoice) {
+      unawaited(_ensureAsr());
+    }
+  }
+
+  Future<void> _startHoldToTalk() async {
+    if (!_inputModeVoice || _busy || _evaluating || _asrLoading) return;
+    if (_streaming) return;
+    await _toggleStreaming();
+  }
+
+  Future<void> _endHoldToTalk() async {
+    if (!_streaming) return;
+    final text = await _stopStreaming(apply: false);
+    if (text == null || text.trim().isEmpty) {
+      _showSnack('没有识别到文字');
+      return;
+    }
+    await _send(text);
+  }
+
+  Widget _holdToTalkButton(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final active = _streaming;
+    final label = _asrLoading
+        ? '正在加载 ASR 模型…'
+        : active
+            ? '松手发送…'
+            : '按住说话';
+    return GestureDetector(
+      onTapDown: (_) => _startHoldToTalk(),
+      onTapUp: (_) => _endHoldToTalk(),
+      onTapCancel: () => _endHoldToTalk(),
+      child: Container(
+        height: 52,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: active ? scheme.primary : scheme.primaryContainer,
+          borderRadius: BorderRadius.circular(18),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 16,
+            fontWeight: FontWeight.w600,
+            color: active ? scheme.onPrimary : scheme.onPrimaryContainer,
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _applyTranscript(String text) {
+    if (!mounted) return;
+    setState(() {
+      if (_tab == 0) {
+        _input.text = text;
+        _input.selection = TextSelection.collapsed(offset: text.length);
+      } else if (_tab == 1) {
+        _routeInput.text = text;
+        _routeInput.selection = TextSelection.collapsed(offset: text.length);
+      }
+    });
+    _showSnack('已转写，确认后发送');
+  }
+
+  Widget _listeningBanner(BuildContext context) {
+    if (!_asrLoading) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: scheme.primaryContainer,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.graphic_eq, size: 18, color: scheme.onPrimaryContainer),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '正在加载 ASR 模型（X-ASR 480ms INT8，约 160MB）…',
+              style: TextStyle(fontSize: 12, color: scheme.onPrimaryContainer),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<sherpa_onnx.OnlineRecognizer?> _ensureAsr() async {
+    if (_asr != null) return _asr;
+    if (_asrLoading) return null;
+    setState(() => _asrLoading = true);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    try {
+      final support = await getApplicationSupportDirectory();
+      final dir = Directory('${support.path}/asr');
+      final int8Encoder = File('${dir.path}/encoder-480ms.int8.onnx');
+      final int8Decoder = File('${dir.path}/decoder-480ms.int8.onnx');
+      final int8Joiner = File('${dir.path}/joiner-480ms.int8.onnx');
+      final fp32Encoder = File('${dir.path}/encoder-480ms.onnx');
+      final fp32Decoder = File('${dir.path}/decoder-480ms.onnx');
+      final fp32Joiner = File('${dir.path}/joiner-480ms.onnx');
+      final tokens = File('${dir.path}/tokens.txt');
+      final useInt8 = await int8Encoder.exists() &&
+          await int8Decoder.exists() &&
+          await int8Joiner.exists();
+      final encoder = useInt8 ? int8Encoder : fp32Encoder;
+      final decoder = useInt8 ? int8Decoder : fp32Decoder;
+      final joiner = useInt8 ? int8Joiner : fp32Joiner;
+      if (!await encoder.exists() ||
+          !await decoder.exists() ||
+          !await joiner.exists() ||
+          !await tokens.exists()) {
+        _showSnack('ASR 模型未安装：${dir.path}');
+        return null;
+      }
+      sherpa_onnx.initBindings();
+      final model = sherpa_onnx.OnlineModelConfig(
+        transducer: sherpa_onnx.OnlineTransducerModelConfig(
+          encoder: encoder.path,
+          decoder: decoder.path,
+          joiner: joiner.path,
+        ),
+        tokens: tokens.path,
+        numThreads: 4,
+        debug: false,
+        modelType: 'zipformer2',
+      );
+      final config = sherpa_onnx.OnlineRecognizerConfig(
+        feat: const sherpa_onnx.FeatureConfig(
+          sampleRate: 16000,
+          featureDim: 80,
+        ),
+        model: model,
+        decodingMethod: 'greedy_search',
+        enableEndpoint: true,
+      );
+      _asr = sherpa_onnx.OnlineRecognizer(config);
+      final vadModel = File('${dir.path}/silero_vad.onnx');
+      if (await vadModel.exists()) {
+        _vad = sherpa_onnx.VoiceActivityDetector(
+          config: sherpa_onnx.VadModelConfig(
+            sileroVad: sherpa_onnx.SileroVadModelConfig(
+              model: vadModel.path,
+              threshold: 0.5,
+              minSilenceDuration: 0.8,
+              minSpeechDuration: 0.3,
+              windowSize: 512,
+              maxSpeechDuration: 20.0,
+            ),
+            sampleRate: 16000,
+            numThreads: 1,
+            debug: false,
+          ),
+          bufferSizeInSeconds: 60,
+        );
+      }
+      debugPrint(
+        '[ASR] model=${useInt8 ? 'int8' : 'fp32'} vad=${_vad != null ? 'on' : 'off'}',
+      );
+      return _asr;
+    } catch (e) {
+      _showSnack('ASR 初始化失败：$e');
+      return null;
+    } finally {
+      if (mounted) setState(() => _asrLoading = false);
+    }
+  }
+
+  String _buildRoutePrompt(String query) {
+    return '<|im_start|>system\n'
+        '你是一个意图分类器。只输出一个字母，不要解释，不要输出其他内容。<|im_end|>\n'
+        '<|im_start|>user\n'
+        '请把下面的句子分类到以下选项之一：\n'
+        'A. 退款\n'
+        'B. 物流\n'
+        'C. 咨询\n'
+        'D. 投诉\n'
+        'E. 其他\n'
+        '句子：$query\n'
+        '只输出字母：<|im_end|>\n'
+        '<|im_start|>assistant\n';
+  }
+
+  String _parseIntent(String raw) {
+    const letterMap = <String, String>{
+      'A': '退款',
+      'B': '物流',
+      'C': '咨询',
+      'D': '投诉',
+      'E': '其他',
+    };
+    final upper = raw.toUpperCase();
+    final match = RegExp(r'(?<![A-Z])([A-E])(?![A-Z])').firstMatch(upper);
+    if (match != null) return letterMap[match.group(1)!]!;
+    for (final label in _intentLabels) {
+      if (raw.contains(label)) return label;
+    }
+    return '未匹配';
+  }
+
+  Future<void> _route() async {
+    final ai = _ai;
+    if (ai == null || _routing || _busy || _evaluating || _streaming) return;
+    final query = _routeInput.text.trim();
+    if (query.isEmpty) return;
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _routing = true;
+      _routeLabel = null;
+      _routeRaw = null;
+      _routeLatency = null;
+    });
+    final stopwatch = Stopwatch()..start();
+    try {
+      final raw = await ai.generate(_buildRoutePrompt(query));
+      stopwatch.stop();
+      if (!mounted) return;
+      final clean = _clean(raw);
+      final label = _parseIntent(clean);
+      setState(() {
+        _routeLabel = label;
+        _routeRaw = clean.isEmpty ? raw.trim() : clean;
+        _routeLatency = stopwatch.elapsedMilliseconds;
+      });
+    } catch (e) {
+      stopwatch.stop();
+      if (!mounted) return;
+      setState(() {
+        _routeLabel = '路由失败';
+        _routeRaw = '$e';
+        _routeLatency = stopwatch.elapsedMilliseconds;
+      });
+    } finally {
+      if (mounted) setState(() => _routing = false);
+    }
+  }
+
+  Future<void> _applySettings(GenerationSettings settings) async {
+    if (!mounted) return;
+    setState(() => _settings = settings);
+    await _initModel();
   }
 
   void _clear() {
@@ -434,10 +1036,53 @@ class _ChatPageState extends State<ChatPage> {
     });
   }
 
-  Future<void> _applySettings(GenerationSettings settings) async {
+  Future<void> _openInfo() async {
+    final path = _modelPath ?? await _expectedModelPath();
     if (!mounted) return;
-    setState(() => _settings = settings);
-    await _initModel();
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('关于这个 Demo'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '模型：MNN-Pocket-0.3B（约 302M 参数，Qwen3 架构）\n'
+                '量化：Q4_1 GGUF（来自 QAT 权重）\n'
+                '文件：约 183 MB\n'
+                '上下文：2048 tokens（本地插件已改 n_ctx）\n'
+                '运行时：llama.cpp（不是 MNN 引擎）\n'
+                'ASR：X-ASR-zh-en 480ms INT8（Zipformer2 / sherpa-onnx）',
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                '说明：这个 Flutter Demo 用于验证模型效果与交互，'
+                '不代表技术报告里的 MNN 引擎性能（Android CPU 解码 251 tok/s 为 MNN 数据）。',
+                style: TextStyle(fontSize: 12),
+              ),
+              const SizedBox(height: 12),
+              const Text('模型路径：',
+                  style: TextStyle(fontWeight: FontWeight.w600)),
+              const SizedBox(height: 4),
+              SelectableText(path, style: const TextStyle(fontSize: 11)),
+              const SizedBox(height: 8),
+              Text(
+                '设备：${_deviceDetail ?? _deviceLabel ?? '本机'}',
+                style: const TextStyle(fontSize: 11),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _openSettings() async {
@@ -496,8 +1141,7 @@ class _ChatPageState extends State<ChatPage> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text('生成参数',
-                    style:
-                        TextStyle(fontSize: 20, fontWeight: FontWeight.w700)),
+                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)),
                 const SizedBox(height: 8),
                 slider(
                   label: '温度',
@@ -571,123 +1215,6 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
-  Future<void> _openInfo() async {
-    final path = _modelPath ?? await _expectedModelPath();
-    if (!mounted) return;
-    await showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('关于这个 Demo'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                '模型：MNN-Pocket-0.3B（约 302M 参数，Qwen3 架构）\n'
-                '量化：Q4_1 GGUF（来自 QAT 权重）\n'
-                '文件：约 183 MB\n'
-                '上下文：2048 tokens（本地插件已改 n_ctx）\n'
-                '运行时：llama.cpp（不是 MNN 引擎）\n'
-                'ASR：X-ASR-zh-en 480ms（Zipformer2 / sherpa-onnx）',
-              ),
-              const SizedBox(height: 12),
-              const Text(
-                '说明：这个 Flutter Demo 用于验证模型效果与交互，'
-                '不代表技术报告里的 MNN 引擎性能（Android CPU 解码 251 tok/s 为 MNN 数据）。',
-                style: TextStyle(fontSize: 12),
-              ),
-              const SizedBox(height: 12),
-              const Text('模型路径：',
-                  style: TextStyle(fontWeight: FontWeight.w600)),
-              const SizedBox(height: 4),
-              SelectableText(path, style: const TextStyle(fontSize: 11)),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('知道了'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  String _buildRoutePrompt(String query) {
-    return '<|im_start|>system\n'
-        '你是一个意图分类器。只输出一个字母，不要解释，不要输出其他内容。<|im_end|>\n'
-        '<|im_start|>user\n'
-        '请把下面的句子分类到以下选项之一：\n'
-        'A. 退款\n'
-        'B. 物流\n'
-        'C. 咨询\n'
-        'D. 投诉\n'
-        'E. 其他\n'
-        '句子：$query\n'
-        '只输出字母：<|im_end|>\n'
-        '<|im_start|>assistant\n';
-  }
-
-  String _parseIntent(String raw) {
-    const letterMap = <String, String>{
-      'A': '退款',
-      'B': '物流',
-      'C': '咨询',
-      'D': '投诉',
-      'E': '其他',
-    };
-    final upper = raw.toUpperCase();
-    final match = RegExp(r'(?<![A-Z])([A-E])(?![A-Z])').firstMatch(upper);
-    if (match != null) return letterMap[match.group(1)!]!;
-    for (final label in _intentLabels) {
-      if (raw.contains(label)) return label;
-    }
-    return '未匹配';
-  }
-
-  Future<void> _route() async {
-    final ai = _ai;
-    if (ai == null || _routing || _busy || _evaluating) return;
-    final query = _routeInput.text.trim();
-    if (query.isEmpty) return;
-    FocusScope.of(context).unfocus();
-    setState(() {
-      _routing = true;
-      _routeLabel = null;
-      _routeRaw = null;
-      _routeLatency = null;
-    });
-
-    final stopwatch = Stopwatch()..start();
-    try {
-      final raw = await ai.generate(_buildRoutePrompt(query));
-      stopwatch.stop();
-      if (!mounted) return;
-      final clean = _clean(raw);
-      final label = _parseIntent(clean);
-      setState(() {
-        _routeLabel = label;
-        _routeRaw = clean.isEmpty ? raw.trim() : clean;
-        _routeLatency = stopwatch.elapsedMilliseconds;
-      });
-      if (_autoSmoke) {
-        debugPrint('[SMOKE-ROUTE] $query -> $label ($clean)');
-      }
-    } catch (e) {
-      stopwatch.stop();
-      if (!mounted) return;
-      setState(() {
-        _routeLabel = '路由失败';
-        _routeRaw = '$e';
-        _routeLatency = stopwatch.elapsedMilliseconds;
-      });
-    } finally {
-      if (mounted) setState(() => _routing = false);
-    }
-  }
-
   Widget _buildRouting(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return SingleChildScrollView(
@@ -710,45 +1237,28 @@ class _ChatPageState extends State<ChatPage> {
             ),
           ),
           const SizedBox(height: 16),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _routeInput,
-                  minLines: 1,
-                  maxLines: 3,
-                  enabled: !_routing && !_busy && !_evaluating,
-                  textInputAction: TextInputAction.done,
-                  onSubmitted: (_) => _route(),
-                  decoration: InputDecoration(
-                    hintText: '例如：我要退款 / 快递到哪了 / 这个多少钱',
-                    filled: true,
-                    fillColor: Colors.white,
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 12,
-                    ),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      borderSide: BorderSide(color: scheme.outlineVariant),
-                    ),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      borderSide: BorderSide(color: scheme.outlineVariant),
-                    ),
-                  ),
-                ),
+          TextField(
+            controller: _routeInput,
+            minLines: 1,
+            maxLines: 3,
+            enabled: !_routing && !_busy && !_evaluating && !_streaming,
+            textInputAction: TextInputAction.done,
+            onSubmitted: (_) => _route(),
+            decoration: InputDecoration(
+              hintText: '例如：我要退款 / 快递到哪了 / 这个多少钱',
+              filled: true,
+              fillColor: Colors.white,
+              contentPadding:
+                  const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(14),
+                borderSide: BorderSide(color: scheme.outlineVariant),
               ),
-              const SizedBox(width: 8),
-              IconButton.filledTonal(
-                onPressed: (_routing || _busy || _evaluating || _transcribing || _asrLoading)
-                    ? null
-                    : _toggleMic,
-                tooltip: _recording ? '停止录音' : '语音输入',
-                icon: Icon(_recording ? Icons.stop : Icons.mic),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(14),
+                borderSide: BorderSide(color: scheme.outlineVariant),
               ),
-            ],
+            ),
           ),
           _listeningBanner(context),
           const SizedBox(height: 8),
@@ -759,7 +1269,7 @@ class _ChatPageState extends State<ChatPage> {
                 .map(
                   (text) => ActionChip(
                     label: Text(text, style: const TextStyle(fontSize: 12)),
-                    onPressed: (_routing || _busy || _evaluating)
+                    onPressed: (_routing || _busy || _evaluating || _streaming)
                         ? null
                         : () => setState(() => _routeInput.text = text),
                   ),
@@ -770,7 +1280,9 @@ class _ChatPageState extends State<ChatPage> {
           SizedBox(
             width: double.infinity,
             child: FilledButton.icon(
-              onPressed: (_routing || _busy || _evaluating) ? null : _route,
+              onPressed: (_routing || _busy || _evaluating || _streaming)
+                  ? null
+                  : _route,
               icon: Icon(_routing ? Icons.hourglass_top : Icons.alt_route),
               label: Text(_routing ? '路由中…' : '路由'),
             ),
@@ -862,272 +1374,6 @@ class _ChatPageState extends State<ChatPage> {
               fontSize: 11.5,
               height: 1.5,
               color: scheme.onSurfaceVariant,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showSnack(String message) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(message)));
-  }
-
-  Future<void> _toggleMic() async {
-    if (_busy || _evaluating || _tab == 2 || _transcribing) return;
-    if (_recording) {
-      _recordTimer?.cancel();
-      _recordTimer = null;
-      final path = await _recorder.stop();
-      if (mounted) setState(() => _recording = false);
-      if (path != null) await _transcribe(path);
-      return;
-    }
-
-    final asr = await _ensureAsr();
-    if (asr == null) return;
-    if (!await _recorder.hasPermission()) {
-      _showSnack('需要麦克风权限');
-      return;
-    }
-
-    final dir = await getTemporaryDirectory();
-    final path = '${dir.path}/asr_${DateTime.now().millisecondsSinceEpoch}.wav';
-    try {
-      await _recorder.start(
-        const RecordConfig(
-          encoder: AudioEncoder.wav,
-          sampleRate: 16000,
-          numChannels: 1,
-        ),
-        path: path,
-      );
-      if (!mounted) return;
-      setState(() => _recording = true);
-      _recordTimer?.cancel();
-      _recordTimer = Timer(const Duration(seconds: 15), () {
-        if (mounted && _recording) _toggleMic();
-      });
-    } catch (e) {
-      _showSnack('录音失败：$e');
-    }
-  }
-
-  Future<sherpa_onnx.OnlineRecognizer?> _ensureAsr() async {
-    if (_asr != null) return _asr;
-    if (_asrLoading) return null;
-    setState(() => _asrLoading = true);
-    // Let the banner paint before the 586 MB model is loaded.
-    await Future<void>.delayed(const Duration(milliseconds: 50));
-    try {
-      final support = await getApplicationSupportDirectory();
-      final dir = Directory('${support.path}/asr');
-      final int8Encoder = File('${dir.path}/encoder-480ms.int8.onnx');
-      final int8Decoder = File('${dir.path}/decoder-480ms.int8.onnx');
-      final int8Joiner = File('${dir.path}/joiner-480ms.int8.onnx');
-      final fp32Encoder = File('${dir.path}/encoder-480ms.onnx');
-      final fp32Decoder = File('${dir.path}/decoder-480ms.onnx');
-      final fp32Joiner = File('${dir.path}/joiner-480ms.onnx');
-      final tokens = File('${dir.path}/tokens.txt');
-      final useInt8 = await int8Encoder.exists() &&
-          await int8Decoder.exists() &&
-          await int8Joiner.exists();
-      final encoder = useInt8 ? int8Encoder : fp32Encoder;
-      final decoder = useInt8 ? int8Decoder : fp32Decoder;
-      final joiner = useInt8 ? int8Joiner : fp32Joiner;
-      if (!await encoder.exists() ||
-          !await decoder.exists() ||
-          !await joiner.exists() ||
-          !await tokens.exists()) {
-        _showSnack('ASR 模型未安装：${dir.path}');
-        return null;
-      }
-      sherpa_onnx.initBindings();
-      final model = sherpa_onnx.OnlineModelConfig(
-        transducer: sherpa_onnx.OnlineTransducerModelConfig(
-          encoder: encoder.path,
-          decoder: decoder.path,
-          joiner: joiner.path,
-        ),
-        tokens: tokens.path,
-        numThreads: 4,
-        debug: false,
-        modelType: 'zipformer2',
-      );
-      final config = sherpa_onnx.OnlineRecognizerConfig(
-        feat: const sherpa_onnx.FeatureConfig(
-          sampleRate: 16000,
-          featureDim: 80,
-        ),
-        model: model,
-        decodingMethod: 'greedy_search',
-        enableEndpoint: false,
-      );
-      _asr = sherpa_onnx.OnlineRecognizer(config);
-
-      final vadModel = File('${dir.path}/silero_vad.onnx');
-      if (await vadModel.exists()) {
-        _vad = sherpa_onnx.VoiceActivityDetector(
-          config: sherpa_onnx.VadModelConfig(
-            sileroVad: sherpa_onnx.SileroVadModelConfig(
-              model: vadModel.path,
-              threshold: 0.5,
-              minSilenceDuration: 0.8,
-              minSpeechDuration: 0.3,
-              windowSize: 512,
-              maxSpeechDuration: 20.0,
-            ),
-            sampleRate: 16000,
-            numThreads: 1,
-            debug: false,
-          ),
-          bufferSizeInSeconds: 60,
-        );
-      }
-      debugPrint(
-        '[ASR] model=${useInt8 ? 'int8' : 'fp32'} vad=${_vad != null ? 'on' : 'off'}',
-      );
-      return _asr;
-    } catch (e) {
-      _showSnack('ASR 初始化失败：$e');
-      return null;
-    } finally {
-      if (mounted) setState(() => _asrLoading = false);
-    }
-  }
-
-  Future<void> _transcribe(String path) async {
-    final asr = _asr;
-    if (asr == null) return;
-    setState(() => _transcribing = true);
-    final sw = Stopwatch()..start();
-    try {
-      final wave = sherpa_onnx.readWave(path);
-      if (wave.samples.isEmpty) {
-        throw Exception('音频为空或格式不支持');
-      }
-
-      final segments = <Float32List>[];
-      final vad = _vad;
-      if (vad != null) {
-        vad.reset();
-        const window = 512;
-        for (var i = 0; i < wave.samples.length; i += window) {
-          final end = i + window;
-          final chunk = end <= wave.samples.length
-              ? wave.samples.sublist(i, end)
-              : wave.samples.sublist(i);
-          vad.acceptWaveform(chunk);
-          while (!vad.isEmpty()) {
-            final seg = vad.front();
-            if (seg.samples.isNotEmpty) segments.add(seg.samples);
-            vad.pop();
-          }
-        }
-        vad.flush();
-        while (!vad.isEmpty()) {
-          final seg = vad.front();
-          if (seg.samples.isNotEmpty) segments.add(seg.samples);
-          vad.pop();
-        }
-      }
-      if (segments.isEmpty) {
-        segments.add(wave.samples);
-      }
-
-      final texts = <String>[];
-      const tailPad = 8000; // 0.5 s at 16 kHz, lets the streaming model emit the tail
-      for (final segment in segments) {
-        final padded = Float32List(segment.length + tailPad)
-          ..setAll(0, segment);
-        final stream = asr.createStream();
-        stream.acceptWaveform(
-          samples: padded,
-          sampleRate: wave.sampleRate,
-        );
-        stream.inputFinished();
-        while (asr.isReady(stream)) {
-          asr.decode(stream);
-        }
-        final part = asr.getResult(stream).text.trim();
-        stream.free();
-        if (part.isNotEmpty) texts.add(part);
-      }
-      final text = texts.join(' ');
-      sw.stop();
-      debugPrint(
-        '[VAD] segments=${segments.length} audio=${(wave.samples.length / wave.sampleRate).toStringAsFixed(1)}s',
-      );
-      if (!mounted) return;
-      if (text.isEmpty) {
-        _showSnack('没有识别到文字');
-      } else {
-        _applyTranscript(text);
-        debugPrint(
-          '[ASR] $text (${sw.elapsedMilliseconds}ms, ${(wave.samples.length / wave.sampleRate).toStringAsFixed(1)}s)',
-        );
-      }
-    } catch (e) {
-      if (mounted) _showSnack('转写失败：$e');
-    } finally {
-      if (mounted) setState(() => _transcribing = false);
-    }
-  }
-
-  void _applyTranscript(String text) {
-    if (!mounted) return;
-    setState(() {
-      _recording = false;
-      if (_tab == 0) {
-        _input.text = text;
-        _input.selection = TextSelection.collapsed(offset: text.length);
-      } else if (_tab == 1) {
-        _routeInput.text = text;
-        _routeInput.selection = TextSelection.collapsed(offset: text.length);
-      }
-    });
-    _showSnack('已转写，确认后发送');
-  }
-
-  Widget _listeningBanner(BuildContext context) {
-    if (!_asrLoading && !_recording && !_transcribing) {
-      return const SizedBox.shrink();
-    }
-    final scheme = Theme.of(context).colorScheme;
-    final label = _asrLoading
-        ? '正在加载 ASR 模型（X-ASR 480ms，约 586MB）…'
-        : _recording
-            ? '正在录音…再次点击麦克风停止'
-            : '正在转写…';
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: _recording ? scheme.errorContainer : scheme.primaryContainer,
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: Row(
-        children: [
-          Icon(
-            _recording ? Icons.fiber_manual_record : Icons.graphic_eq,
-            size: 18,
-            color: _recording
-                ? scheme.onErrorContainer
-                : scheme.onPrimaryContainer,
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              label,
-              style: TextStyle(
-                fontSize: 12,
-                color: _recording
-                    ? scheme.onErrorContainer
-                    : scheme.onPrimaryContainer,
-              ),
             ),
           ),
         ],
@@ -1596,7 +1842,9 @@ class _ChatPageState extends State<ChatPage> {
   @override
   void dispose() {
     _ai?.dispose();
-    _recordTimer?.cancel();
+    _streamSub?.cancel();
+    _recorder.stop();
+    _liveStream?.free();
     _recorder.dispose();
     _vad?.free();
     _asr?.free();
@@ -1641,13 +1889,13 @@ class _ChatPageState extends State<ChatPage> {
           ),
           if (ready && _tab == 0)
             IconButton(
-              onPressed: (_busy || _evaluating) ? null : _openSettings,
+              onPressed: (_busy || _evaluating || _streaming) ? null : _openSettings,
               tooltip: '生成参数',
               icon: const Icon(Icons.tune),
             ),
           if (ready && _tab == 0)
             IconButton(
-              onPressed: (_busy || _evaluating) ? null : _clear,
+              onPressed: (_busy || _evaluating || _streaming) ? null : _clear,
               tooltip: '清空对话',
               icon: const Icon(Icons.delete_outline),
             ),
@@ -1662,27 +1910,6 @@ class _ChatPageState extends State<ChatPage> {
                 : _tab == 1
                     ? _buildRouting(context)
                     : _buildEval(context),
-      ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _tab,
-        onDestinationSelected: (index) => setState(() => _tab = index),
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.chat_bubble_outline),
-            selectedIcon: Icon(Icons.chat_bubble),
-            label: '对话',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.alt_route),
-            selectedIcon: Icon(Icons.alt_route),
-            label: '意图路由',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.analytics_outlined),
-            selectedIcon: Icon(Icons.analytics),
-            label: '评测',
-          ),
-        ],
       ),
     );
   }
@@ -1732,60 +1959,76 @@ class _ChatPageState extends State<ChatPage> {
           padding: const EdgeInsets.symmetric(horizontal: 12),
           child: _listeningBanner(context),
         ),
+        _livePanel(context),
         Container(
-          padding: EdgeInsets.fromLTRB(
+          margin: EdgeInsets.fromLTRB(
             12,
-            8,
+            0,
             12,
             8 + MediaQuery.of(context).padding.bottom,
           ),
+          padding: const EdgeInsets.fromLTRB(16, 12, 10, 8),
           decoration: BoxDecoration(
             color: Colors.white,
-            border: Border(top: BorderSide(color: scheme.outlineVariant)),
+            borderRadius: BorderRadius.circular(26),
+            border: Border.all(color: scheme.outlineVariant),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.04),
+                blurRadius: 10,
+                offset: const Offset(0, 2),
+              ),
+            ],
           ),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Expanded(
-                child: TextField(
+              if (_inputModeVoice)
+                _holdToTalkButton(context)
+              else
+                TextField(
                   controller: _input,
                   minLines: 1,
                   maxLines: 4,
-                  enabled: !_busy && !_evaluating,
+                  enabled: !_busy && !_evaluating && !_streaming,
                   textInputAction: TextInputAction.send,
                   onSubmitted: (_) => _send(),
+                  style: const TextStyle(fontSize: 15),
                   decoration: InputDecoration(
-                    hintText: _busy ? '正在本地推理…' : '问点什么…',
-                    filled: true,
-                    fillColor: scheme.surfaceContainerHighest.withValues(
-                      alpha: 0.45,
+                    hintText: '发消息或按住说话',
+                    hintStyle: TextStyle(
+                      fontSize: 15,
+                      color: scheme.onSurfaceVariant,
                     ),
-                    contentPadding:
-                        const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(16),
-                      borderSide: BorderSide.none,
-                    ),
+                    border: InputBorder.none,
+                    isDense: true,
+                    contentPadding: EdgeInsets.zero,
                   ),
                 ),
-              ),
-              IconButton(
-                onPressed: (_busy || _evaluating || _transcribing || _asrLoading) ? null : _toggleMic,
-                tooltip: _recording ? '停止录音' : '语音输入',
-                icon: Icon(
-                  _recording ? Icons.stop_circle_outlined : Icons.mic_none,
-                ),
-              ),
-              const SizedBox(width: 4),
-              IconButton.filled(
-                onPressed: (_busy || _evaluating) ? null : () => _send(),
-                tooltip: '发送',
-                icon: Icon(_busy ? Icons.hourglass_top : Icons.arrow_upward),
-                style: IconButton.styleFrom(
-                  backgroundColor: scheme.primary,
-                  foregroundColor: scheme.onPrimary,
-                  padding: const EdgeInsets.all(12),
-                ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  const Spacer(),
+                  IconButton(
+                    onPressed: _busy
+                        ? _stopGeneration
+                        : (_evaluating ? null : _toggleInputMode),
+                    tooltip: _busy
+                        ? '停止生成'
+                        : (_inputModeVoice ? '切换键盘' : '切换语音'),
+                    icon: Icon(
+                      _busy
+                          ? Icons.stop_circle
+                          : (_inputModeVoice
+                              ? Icons.keyboard_alt_outlined
+                              : Icons.mic_none),
+                    ),
+                    style: IconButton.styleFrom(
+                      side: BorderSide(color: scheme.outlineVariant),
+                      foregroundColor: scheme.onSurface,
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
@@ -2051,12 +2294,62 @@ class _Bubble extends StatelessWidget {
                 ],
               )
             else
-              SelectableText(
-                message.text,
-                style: TextStyle(
-                  fontSize: 15,
-                  height: 1.55,
-                  color: isUser ? scheme.onPrimary : scheme.onSurface,
+              MarkdownBody(
+                data: message.text,
+                selectable: true,
+                styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context))
+                    .copyWith(
+                  p: TextStyle(
+                    fontSize: 15,
+                    height: 1.55,
+                    color: isUser ? scheme.onPrimary : scheme.onSurface,
+                  ),
+                  a: TextStyle(
+                    color: isUser ? scheme.onPrimary : scheme.primary,
+                    decoration: TextDecoration.underline,
+                  ),
+                  code: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 13,
+                    color: isUser ? scheme.onPrimary : scheme.onSurface,
+                    backgroundColor: isUser
+                        ? Colors.white.withValues(alpha: 0.18)
+                        : scheme.surfaceContainerHighest.withValues(alpha: 0.7),
+                  ),
+                  codeblockPadding: const EdgeInsets.all(10),
+                  codeblockDecoration: BoxDecoration(
+                    color: isUser
+                        ? Colors.white.withValues(alpha: 0.15)
+                        : scheme.surfaceContainerHighest.withValues(alpha: 0.6),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  blockquoteDecoration: BoxDecoration(
+                    color: isUser
+                        ? Colors.white.withValues(alpha: 0.12)
+                        : scheme.surfaceContainerHighest.withValues(alpha: 0.4),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  blockquotePadding: const EdgeInsets.all(10),
+                  h1: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                    color: isUser ? scheme.onPrimary : scheme.onSurface,
+                  ),
+                  h2: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                    color: isUser ? scheme.onPrimary : scheme.onSurface,
+                  ),
+                  h3: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                    color: isUser ? scheme.onPrimary : scheme.onSurface,
+                  ),
+                  listBullet: TextStyle(
+                    fontSize: 15,
+                    color: isUser ? scheme.onPrimary : scheme.onSurface,
+                  ),
+                  blockSpacing: 8,
                 ),
               ),
             if (message.meta != null) ...[

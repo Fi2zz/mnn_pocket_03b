@@ -46,6 +46,9 @@ class OneNmNative {
      */
     external fun generate(prompt: String, temperature: Float, topK: Int, topP: Float, maxTokens: Int, repeatPenalty: Float): String
 
+    /** Requests cancellation of the current generate() call; the call returns the partial text. */
+    external fun cancelGenerate()
+
     /** Frees the model, context, and backend resources. */
     external fun releaseModel()
 

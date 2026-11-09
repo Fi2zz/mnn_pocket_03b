@@ -29,6 +29,7 @@
 #include <dlfcn.h>
 #include <dirent.h>
 #include <cerrno>
+#include <atomic>
 
 #include "llama.h"
 #include "ggml.h"
@@ -51,6 +52,7 @@ static void llama_log_callback(enum ggml_log_level level, const char * text, voi
 static llama_model * model = nullptr;
 static llama_context * ctx = nullptr;
 static bool backend_initialized = false;
+static std::atomic<bool> cancel_requested{false};
 
 // ---------------------------------------------------------------------------
 // initBackend — Discover and load ggml backends before model loading.
@@ -294,9 +296,14 @@ Java_com_theorangeshade_onenm_1local_1llm_OneNmNative_generate(
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
 
     std::string result;
+    cancel_requested.store(false);
 
     // Auto-regressive generation loop.
     for (int i = 0; i < (int)maxTokens; i++) {
+        if (cancel_requested.load()) {
+            LOGI("Generation cancelled at token %d", i);
+            break;
+        }
         llama_token new_token = llama_sampler_sample(smpl, ctx, -1);
 
         // Check for end of generation
@@ -337,6 +344,15 @@ Java_com_theorangeshade_onenm_1local_1llm_OneNmNative_generate(
 // ---------------------------------------------------------------------------
 // releaseModel  — Free all native resources.
 // ---------------------------------------------------------------------------
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_theorangeshade_onenm_1local_1llm_OneNmNative_cancelGenerate(
+        JNIEnv * env,
+        jobject thiz) {
+    cancel_requested.store(true);
+    LOGI("cancelGenerate requested");
+}
+
 extern "C"
 JNIEXPORT void JNICALL
 Java_com_theorangeshade_onenm_1local_1llm_OneNmNative_releaseModel(

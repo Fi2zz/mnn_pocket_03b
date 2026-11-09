@@ -42,6 +42,11 @@ class MethodChannelOnenmLocalLlm extends OnenmLocalLlmPlatform {
   }
 
   @override
+  Future<void> cancelGenerate() async {
+    await methodChannel.invokeMethod('cancelGenerate');
+  }
+
+  @override
   Future<void> releaseModel() async {
     await methodChannel.invokeMethod('releaseModel');
   }

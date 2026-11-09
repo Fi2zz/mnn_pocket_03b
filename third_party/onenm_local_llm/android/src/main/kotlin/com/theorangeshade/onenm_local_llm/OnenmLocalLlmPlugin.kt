@@ -184,6 +184,11 @@ class OnenmLocalLlmPlugin: FlutterPlugin, MethodCallHandler {
         }
       }
 
+      "cancelGenerate" -> {
+        getNative().cancelGenerate()
+        result.success(null)
+      }
+
       "releaseModel" -> {
         native?.releaseModel()
         result.success(null)

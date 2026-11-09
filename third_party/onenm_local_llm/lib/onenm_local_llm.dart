@@ -208,6 +208,14 @@ class OneNm {
     return output;
   }
 
+  /// Requests cancellation of the current [chat] / [generate] call.
+  ///
+  /// The in-flight call returns the text generated so far.
+  Future<void> cancelGenerate() async {
+    if (!_ready) return;
+    await OnenmLocalLlmPlatform.instance.cancelGenerate();
+  }
+
   /// Clears the conversation history to start a fresh chat session.
   void clearHistory() {
     _log('History cleared (was ${_history.length} messages)');
