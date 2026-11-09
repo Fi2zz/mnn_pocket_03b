@@ -1,0 +1,10 @@
+node_modules/
+dist/
+build/
+target/
+.DS_Store
+*.log
+.env*
+
+# 本地下载的第三方资料（技术报告 PDF、模型卡等），可随时重新拉取
+_sources/
