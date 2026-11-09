@@ -8,3 +8,25 @@ target/
 
 # 本地下载的第三方资料（技术报告 PDF、模型卡等），可随时重新拉取
 _sources/
+
+# PDF 构建中间产物
+_report_build/
+_report_build_model/
+
+# 本地调查证据缓存（模型卡、API 快照、讨论区记录）
+_hf_investigation/
+
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins-dependencies
+*.iml
+.idea/
+
+# Android / native 构建中间产物
+**/.cxx/
+android/.gradle/
+android/.kotlin/
+android/local.properties
+android/key.properties
+*.jks
+*.keystore

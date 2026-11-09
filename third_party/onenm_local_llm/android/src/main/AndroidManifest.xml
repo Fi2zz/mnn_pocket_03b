@@ -1,0 +1,8 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+  package="com.theorangeshade.onenm_local_llm">
+  <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
+  <!-- Request native lib extraction so ggml can discover backend .so files
+       via directory scanning. Works on some devices (e.g. S21 FE); on devices
+       where AGP overrides this, the Kotlin layer extracts from the APK. -->
+  <application android:extractNativeLibs="true" />
+</manifest>
