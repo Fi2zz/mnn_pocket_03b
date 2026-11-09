@@ -974,10 +974,10 @@ class _ChatPageState extends State<ChatPage> {
             sileroVad: sherpa_onnx.SileroVadModelConfig(
               model: vadModel.path,
               threshold: 0.5,
-              minSilenceDuration: 0.25,
-              minSpeechDuration: 0.25,
+              minSilenceDuration: 0.8,
+              minSpeechDuration: 0.3,
               windowSize: 512,
-              maxSpeechDuration: 10.0,
+              maxSpeechDuration: 20.0,
             ),
             sampleRate: 16000,
             numThreads: 1,
@@ -1038,10 +1038,13 @@ class _ChatPageState extends State<ChatPage> {
       }
 
       final texts = <String>[];
+      const tailPad = 8000; // 0.5 s at 16 kHz, lets the streaming model emit the tail
       for (final segment in segments) {
+        final padded = Float32List(segment.length + tailPad)
+          ..setAll(0, segment);
         final stream = asr.createStream();
         stream.acceptWaveform(
-          samples: segment,
+          samples: padded,
           sampleRate: wave.sampleRate,
         );
         stream.inputFinished();
