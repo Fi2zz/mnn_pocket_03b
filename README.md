@@ -114,13 +114,17 @@ flutter pub get
 
 ### 2. 准备模型
 
-LLM（必须）：
+LLM（必须，5 个文件）：
 
 ```text
-_sources/MNN-Pocket-0.3B-Instruct-Q4_1.gguf        183 MB
+_sources/MNN-Pocket-0.3B-MNN/config.json
+_sources/MNN-Pocket-0.3B-MNN/llm.mnn
+_sources/MNN-Pocket-0.3B-MNN/llm.mnn.weight            166.2 MiB
+_sources/MNN-Pocket-0.3B-MNN/llm_config.json
+_sources/MNN-Pocket-0.3B-MNN/tokenizer.mtok
 ```
 
-来源：<https://modelscope.cn/models/MNN/MNN-Pocket-0.3B-GGUF>
+来源：<https://modelscope.cn/models/MNN/MNN-Pocket-0.3B-MNN>
 
 ASR + VAD（语音输入需要）：
 
@@ -161,7 +165,7 @@ tools/provision_device.sh --help
 
 | 文件 | 设备路径 |
 | --- | --- |
-| LLM | `/data/user/0/com.example.mnn/app_flutter/models/` |
+| LLM（5 个文件） | `/data/user/0/com.example.mnn/app_flutter/models/MNN-Pocket-0.3B-MNN/` |
 | ASR / VAD / tokens | `/data/user/0/com.example.mnn/files/asr/` |
 
 > 必须使用 **debug APK**，脚本依赖 `run-as` 写入应用私有目录。Release 包无法用这个方式配置。

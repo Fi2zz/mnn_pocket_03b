@@ -5,7 +5,8 @@
 #   tools/provision_device.sh [--serial SERIAL] [--install]
 #
 # What it pushes:
-#   LLM  : _sources/MNN-Pocket-0.3B-Instruct-Q4_1.gguf  -> app_flutter/models/
+#   LLM  : _sources/MNN-Pocket-0.3B-MNN/{config.json,llm.mnn,llm.mnn.weight,
+#          llm_config.json,tokenizer.mtok} -> app_flutter/models/MNN-Pocket-0.3B-MNN/
 #   ASR  : INT8 encoder/decoder/joiner + tokens.txt     -> files/asr/
 #   VAD  : silero_vad.onnx                              -> files/asr/
 #
@@ -83,7 +84,14 @@ if ! "${ADB[@]}" shell run-as "$APP_ID" id >/dev/null 2>&1; then
   exit 1
 fi
 
-LLM="$ROOT/_sources/MNN-Pocket-0.3B-Instruct-Q4_1.gguf"
+MODEL_DIR="$ROOT/_sources/MNN-Pocket-0.3B-MNN"
+MODEL_FILES=(
+  "config.json"
+  "llm.mnn"
+  "llm.mnn.weight"
+  "llm_config.json"
+  "tokenizer.mtok"
+)
 ASR_FILES=(
   "$ROOT/_sources/xasr/encoder-480ms.int8.onnx"
   "$ROOT/_sources/xasr/decoder-480ms.int8.onnx"
@@ -92,7 +100,13 @@ ASR_FILES=(
   "$ROOT/_sources/asr/silero_vad.onnx"
 )
 
-for f in "$LLM" "${ASR_FILES[@]}"; do
+for f in "${MODEL_FILES[@]}"; do
+  if [[ ! -f "$MODEL_DIR/$f" ]]; then
+    echo "missing model file: $MODEL_DIR/$f" >&2
+    exit 1
+  fi
+done
+for f in "${ASR_FILES[@]}"; do
   if [[ ! -f "$f" ]]; then
     echo "missing model file: $f" >&2
     exit 1
@@ -102,7 +116,8 @@ done
 echo "stopping app..."
 "${ADB[@]}" shell am force-stop "$APP_ID" >/dev/null 2>&1 || true
 
-"${ADB[@]}" shell run-as "$APP_ID" mkdir -p app_flutter/models files/asr
+"${ADB[@]}" shell run-as "$APP_ID" mkdir -p \
+  app_flutter/models/MNN-Pocket-0.3B-MNN files/asr
 
 push_file() {
   local src="$1"
@@ -115,13 +130,16 @@ push_file() {
   "${ADB[@]}" shell "rm -f /data/local/tmp/${name}" >/dev/null 2>&1 || true
 }
 
-push_file "$LLM" app_flutter/models
+for f in "${MODEL_FILES[@]}"; do
+  push_file "$MODEL_DIR/$f" app_flutter/models/MNN-Pocket-0.3B-MNN
+done
 for f in "${ASR_FILES[@]}"; do
   push_file "$f" files/asr
 done
 
 echo
 echo "done:"
-"${ADB[@]}" shell run-as "$APP_ID" ls -lh app_flutter/models files/asr
+"${ADB[@]}" shell run-as "$APP_ID" ls -lh \
+  app_flutter/models/MNN-Pocket-0.3B-MNN files/asr
 echo
 echo "relaunch the app to load the new weights."
