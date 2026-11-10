@@ -11,6 +11,7 @@ import 'package:record/record.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa_onnx;
 
 import 'model_config.dart';
+import 'meta_format.dart';
 
 /// Optional headless smoke test: `flutter run --dart-define=AUTO_SMOKE=true`.
 const bool _autoSmoke = bool.fromEnvironment('AUTO_SMOKE');
@@ -412,15 +413,14 @@ class _ChatPageState extends State<ChatPage> {
       if (!mounted) return;
       setState(() {
         _messages.last.text = clean.isEmpty ? '（模型没有返回内容）' : clean;
-        final device = _deviceLabel == null ? '' : '$_deviceLabel · ';
-        final gen = _settings;
-        final genText =
-            'T=${gen.temperature.toStringAsFixed(2)} · top_p=${gen.topP.toStringAsFixed(2)}'
-            ' · top_k=${gen.topK} · max=${gen.maxTokens}'
-            ' · repeat=${gen.repeatPenalty.toStringAsFixed(2)}';
-        _messages.last.meta =
-            '$device${(stopwatch.elapsedMilliseconds / 1000).toStringAsFixed(2)}s · ${clean.length} 字'
-            '${_stopRequested ? ' · 已停止' : ''}\n$genText';
+        final meta = formatMetaLine(
+          device: _deviceLabel,
+          seconds: stopwatch.elapsedMilliseconds / 1000,
+          chars: clean.length,
+          result: ai.lastResult,
+          stopped: _stopRequested,
+        );
+        _messages.last.meta = '$meta\n${formatSettingsLine(_settings)}';
       });
       if (_autoSmoke) {
         debugPrint(
@@ -1013,16 +1013,16 @@ class _ChatPageState extends State<ChatPage> {
             children: [
               const Text(
                 '模型：MNN-Pocket-0.3B（约 302M 参数，Qwen3 架构）\n'
-                '量化：Q4_1 GGUF（来自 QAT 权重）\n'
-                '文件：约 183 MB\n'
-                '上下文：2048 tokens（本地插件已改 n_ctx）\n'
-                '运行时：llama.cpp（不是 MNN 引擎）\n'
+                '量化：MNN INT4（W4A16，来自 QAT 权重）\n'
+                '文件：约 166 MB（5 个文件）\n'
+                '上下文：模型支持最长 32K，Demo 按 2048 使用\n'
+                '运行时：MNN runtime（CPU，4 线程）\n'
                 'ASR：X-ASR-zh-en 480ms INT8（Zipformer2 / sherpa-onnx）',
               ),
               const SizedBox(height: 12),
               const Text(
-                '说明：这个 Flutter Demo 用于验证模型效果与交互，'
-                '不代表技术报告里的 MNN 引擎性能（Android CPU 解码 251 tok/s 为 MNN 数据）。',
+                '说明：这个 Flutter Demo 直接用 MNN 引擎加载 INT4 模型；'
+                '指标行里的 tok/s 是 decode 阶段的原生统计。',
                 style: TextStyle(fontSize: 12),
               ),
               const SizedBox(height: 12),
@@ -1833,7 +1833,7 @@ class _ChatPageState extends State<ChatPage> {
               !ready
                   ? '端侧小模型实验'
                   : _tab == 0
-                      ? '端侧 · GGUF Q4_1 · llama.cpp'
+                      ? '端侧 · MNN INT4 · CPU'
                       : _tab == 1
                           ? '闭集路由 · 5 个标签'
                           : '路由批量评测',
@@ -2032,7 +2032,7 @@ class _ChatPageState extends State<ChatPage> {
           const SizedBox(height: 6),
           Center(
             child: Text(
-              '302M 参数 · Q4_1 GGUF · 183 MB',
+              '302M 参数 · MNN INT4 · 166 MB',
               style: TextStyle(
                 fontSize: 13,
                 color: scheme.onSurfaceVariant,
@@ -2087,7 +2087,7 @@ class _ChatPageState extends State<ChatPage> {
                   const SizedBox(height: 8),
                   Text(
                     downloading
-                        ? '首次运行会从 ModelScope 下载约 183 MB，之后完全离线。'
+                        ? '首次运行会从 ModelScope 下载约 166 MB，之后完全离线。'
                         : '正在把权重加载到内存，请稍候…',
                     style: TextStyle(
                       fontSize: 12,
@@ -2132,8 +2132,8 @@ class _ChatPageState extends State<ChatPage> {
           ),
           const SizedBox(height: 18),
           Text(
-            '这个 Demo 用 llama.cpp 跑 GGUF，用于验证模型效果；'
-            'MNN 引擎的端侧性能需要另行集成，二者不要混为一谈。',
+            '这个 Demo 直接用 MNN runtime 加载 INT4 模型，'
+            '指标行里的 tok/s 是 decode 阶段的原生统计。',
             style: TextStyle(
               fontSize: 12,
               height: 1.5,
@@ -2235,26 +2235,12 @@ class _Bubble extends StatelessWidget {
               ),
             if (!isUser) const SizedBox(height: 3),
             if (waiting)
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: scheme.primary,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    '正在本地推理…',
-                    style: TextStyle(
-                      fontSize: 13,
-                      color: scheme.onSurfaceVariant,
-                    ),
-                  ),
-                ],
+              Text(
+                '正在本地推理…',
+                style: TextStyle(
+                  fontSize: 13,
+                  color: scheme.onSurfaceVariant,
+                ),
               )
             else
               MarkdownBody(
