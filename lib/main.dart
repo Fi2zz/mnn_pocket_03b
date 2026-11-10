@@ -5,10 +5,12 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
-import 'package:onenm_local_llm/onenm_local_llm.dart';
+import 'package:mnn_local_llm/mnn_local_llm.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa_onnx;
+
+import 'model_config.dart';
 
 /// Optional headless smoke test: `flutter run --dart-define=AUTO_SMOKE=true`.
 const bool _autoSmoke = bool.fromEnvironment('AUTO_SMOKE');
@@ -20,40 +22,6 @@ const MethodChannel _deviceInfoChannel = MethodChannel('device_info');
 
 /// Optional streaming ASR self-test: `flutter run --dart-define=AUTO_STREAM=true`.
 const bool _autoStream = bool.fromEnvironment('AUTO_STREAM');
-
-const String _systemPrompt =
-    '你是 MNN-Pocket，一个完全运行在手机本地的 AI 助手。回答简洁、准确，优先使用用户的语言。';
-
-/// MNN-Pocket-0.3B, Q4_1 GGUF (183 MB), served by llama.cpp.
-///
-/// Note: this demo validates the *model*, not the MNN engine. The technical
-/// report's 251 tok/s Android CPU number is MNN-specific and is not reproduced
-/// by this llama.cpp build.
-const ModelInfo _pocketModel = ModelInfo(
-  id: 'mnn-pocket-0.3b',
-  name: 'MNN-Pocket 0.3B',
-  fileName: 'MNN-Pocket-0.3B-Instruct-Q4_1.gguf',
-  ggufUrl:
-      'https://modelscope.cn/models/MNN/MNN-Pocket-0.3B-GGUF/resolve/master/MNN-Pocket-0.3B-Instruct-Q4_1.gguf',
-  sizeMB: 183,
-  minRamGB: 1,
-  // The vendored bridge is patched to n_ctx = 2048.
-  context: 2048,
-  chatTemplate: ChatTemplate(
-    system: '<|im_start|>system\n{text}<|im_end|>\n',
-    user: '<|im_start|>user\n{text}<|im_end|>\n',
-    assistant: '<|im_start|>assistant\n{text}<|im_end|>\n',
-    systemDefault: _systemPrompt,
-  ),
-);
-
-const GenerationSettings _defaultSettings = GenerationSettings(
-  temperature: 0.4,
-  topK: 20,
-  topP: 0.8,
-  maxTokens: 768,
-  repeatPenalty: 1.1,
-);
 
 const List<String> _suggestions = <String>[
   '用 Rust 写一个斐波那契函数，带注释',
@@ -169,9 +137,9 @@ class ChatPage extends StatefulWidget {
 }
 
 class _ChatPageState extends State<ChatPage> {
-  OneNm? _ai;
+  MnnLlm? _ai;
   ModelPhase _phase = ModelPhase.idle;
-  String _status = '首次使用需要下载模型（约 183 MB）';
+  String _status = '首次使用需要下载模型（约 166 MB）';
   String? _error;
   String? _modelPath;
   double? _progress;
@@ -210,7 +178,7 @@ class _ChatPageState extends State<ChatPage> {
   bool _evalDone = false;
   final List<_EvalResult> _evalResults = <_EvalResult>[];
 
-  GenerationSettings _settings = _defaultSettings;
+  MnnGenerationSettings _settings = defaultSettings;
   final List<_Message> _messages = <_Message>[];
   final TextEditingController _input = TextEditingController();
   final ScrollController _scroll = ScrollController();
@@ -277,18 +245,14 @@ class _ChatPageState extends State<ChatPage> {
 
   Future<String> _expectedModelPath() async {
     final dir = await getApplicationDocumentsDirectory();
-    return '${dir.path}/models/${_pocketModel.fileName}';
+    return '${dir.path}/models/${pocketModel.dirName}';
   }
 
   Future<void> _bootstrap() async {
     final path = await _expectedModelPath();
     if (!mounted) return;
     setState(() => _modelPath = path);
-    final file = File(path);
-    final exists = await file.exists();
-    final length = exists ? await file.length() : 0;
-    if (!mounted) return;
-    if (exists && length > 150 * 1024 * 1024) {
+    if (await isModelComplete(Directory(path), pocketModel)) {
       await _initModel();
     } else {
       setState(() => _phase = ModelPhase.idle);
@@ -318,12 +282,11 @@ class _ChatPageState extends State<ChatPage> {
       _progress = null;
     });
 
-    final ai = OneNm(
-      model: _pocketModel,
+    final ai = MnnLlm(
+      model: pocketModel,
       settings: _settings,
       onProgress: _onProgress,
       onRetryRequired: _onRetry,
-      debug: kDebugMode,
     );
 
     try {
@@ -443,7 +406,7 @@ class _ChatPageState extends State<ChatPage> {
 
     final stopwatch = Stopwatch()..start();
     try {
-      final reply = await ai.chat(text, systemPrompt: _systemPrompt);
+      final reply = await ai.chat(text, systemPrompt: systemPrompt);
       final clean = _clean(reply);
       stopwatch.stop();
       if (!mounted) return;
@@ -1021,7 +984,7 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
-  Future<void> _applySettings(GenerationSettings settings) async {
+  Future<void> _applySettings(MnnGenerationSettings settings) async {
     if (!mounted) return;
     setState(() => _settings = settings);
     await _initModel();
@@ -1204,7 +1167,7 @@ class _ChatPageState extends State<ChatPage> {
 
     if (applied == true) {
       await _applySettings(
-        GenerationSettings(
+        MnnGenerationSettings(
           temperature: temperature,
           topK: topK.round(),
           topP: topP,

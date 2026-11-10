@@ -14,6 +14,7 @@ analyzer:
     - build/**
     - android/**
     - third_party/**
+    - _sources/**
 
 linter:
   # The lint rules applied to this project can be customized in the
