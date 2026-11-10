@@ -1,9 +1,9 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:onenm_local_llm/onenm_local_llm.dart';
+import 'package:mnn_local_llm/mnn_local_llm.dart';
 
 void main() {
   test('MNN-Pocket ChatML template renders the expected prompt', () {
-    const template = ChatTemplate(
+    const template = MnnChatTemplate(
       system: '<|im_start|>system\n{text}<|im_end|>\n',
       user: '<|im_start|>user\n{text}<|im_end|>\n',
       assistant: '<|im_start|>assistant\n{text}<|im_end|>\n',

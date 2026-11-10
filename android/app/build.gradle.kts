@@ -27,6 +27,21 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // The MNN runtime is arm64-v8a only; drop Flutter's other ABI payloads.
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    packaging {
+        jniLibs {
+            excludes += listOf(
+                "lib/armeabi-v7a/**",
+                "lib/x86/**",
+                "lib/x86_64/**",
+            )
+        }
     }
 
     buildTypes {
