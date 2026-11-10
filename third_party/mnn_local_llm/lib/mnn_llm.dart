@@ -40,7 +40,7 @@ class MnnLlm {
 
   Future<void> initialize() async {
     final root = modelRoot ?? await getApplicationDocumentsDirectory();
-    final modelDir = Directory('${root.path}/${model.dirName}');
+    final modelDir = Directory('${root.path}/models/${model.dirName}');
     await modelDir.create(recursive: true);
     _modelDir = modelDir;
 

@@ -66,7 +66,7 @@ void main() {
 
   setUp(() async {
     tmp = await Directory.systemTemp.createTemp('mnn_llm_test');
-    final modelDir = Directory('${tmp.path}/${_model.dirName}');
+    final modelDir = Directory('${tmp.path}/models/${_model.dirName}');
     await modelDir.create(recursive: true);
     await File('${modelDir.path}/a.json').writeAsBytes(List.filled(4, 1));
     await File('${modelDir.path}/w.weight').writeAsBytes(List.filled(8, 1));
@@ -88,7 +88,7 @@ void main() {
 
   test('initialize loads the model directory and reports Ready', () async {
     await ai.initialize();
-    expect(platform.loadedDir, '${tmp.path}/${_model.dirName}');
+    expect(platform.loadedDir, '${tmp.path}/models/${_model.dirName}');
     expect(progress, contains('Ready'));
   });
 
