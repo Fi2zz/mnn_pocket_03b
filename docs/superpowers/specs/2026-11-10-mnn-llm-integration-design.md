@@ -1,7 +1,7 @@
 # MNN 端侧 LLM 后端替换设计
 
 - 日期：2026-11-10
-- 状态：待评审
+- 状态：已评审（2026-11-10）
 - 目标仓库：`/Users/fitz/REPO/mnn`
 - 相关测量：`_sources/mnn-bench/RESULTS.md`
 
