@@ -2,3 +2,4 @@
 library mnn_local_llm;
 
 export 'models.dart';
+export 'model_store.dart';
