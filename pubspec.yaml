@@ -38,6 +38,8 @@ dependencies:
   path_provider: ^2.1.6
   onenm_local_llm:
     path: third_party/onenm_local_llm
+  mnn_local_llm:
+    path: third_party/mnn_local_llm
   sherpa_onnx: ^2.0.1
   record: ^7.1.2
   flutter_markdown: ^0.7.7+1
