@@ -53,20 +53,26 @@ class MnnLlm {
     );
 
     await store.ensureModel();
-    var loaded =
-        await MnnLocalLlmPlatform.instance.loadModel(modelDir.path) == true;
+    var loaded = await _loadModel(modelDir.path);
 
     if (!loaded) {
       _report('Model load failed, re-downloading...');
       if (await modelDir.exists()) await modelDir.delete(recursive: true);
       await store.ensureModel();
-      loaded =
-          await MnnLocalLlmPlatform.instance.loadModel(modelDir.path) == true;
+      loaded = await _loadModel(modelDir.path);
       if (!loaded) throw Exception('Failed to load MNN model');
     }
 
     _ready = true;
     _report('Ready');
+  }
+
+  Future<bool> _loadModel(String path) async {
+    try {
+      return await MnnLocalLlmPlatform.instance.loadModel(path) == true;
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<String> chat(String message, {String? systemPrompt}) async {

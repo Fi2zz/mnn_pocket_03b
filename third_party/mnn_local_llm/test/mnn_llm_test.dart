@@ -1,6 +1,8 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:mnn_local_llm/mnn_local_llm.dart';
 
 const _model = MnnModel(
@@ -27,9 +29,15 @@ class _FakePlatform extends MnnLocalLlmPlatform {
   bool cancelled = false;
   bool released = false;
   bool returnNull = false;
+  bool throwOnFirstLoad = false;
+  int loadCalls = 0;
 
   @override
   Future<bool?> loadModel(String dir) async {
+    loadCalls++;
+    if (throwOnFirstLoad && loadCalls == 1) {
+      throw Exception('native load failed');
+    }
     loadedDir = dir;
     return true;
   }
@@ -136,6 +144,29 @@ void main() {
     await expectLater(
       ai.generate('hi'),
       throwsA(isA<Exception>()),
+    );
+  });
+
+  test('load exception re-downloads and retries once', () async {
+    platform.throwOnFirstLoad = true;
+    final client = MockClient((request) async {
+      final length = request.url.path.endsWith('a.json') ? 4 : 8;
+      return http.Response.bytes(List.filled(length, 1), 200);
+    });
+    ai = MnnLlm(
+      model: _model,
+      modelRoot: tmp,
+      onProgress: (_) {},
+      onRetryRequired: (_) async => false,
+      clientFactory: () => client,
+    );
+
+    await ai.initialize();
+
+    expect(platform.loadCalls, 2);
+    expect(
+      await File('${tmp.path}/models/${_model.dirName}/a.json').exists(),
+      isTrue,
     );
   });
 }

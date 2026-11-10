@@ -89,6 +89,7 @@ Java_com_example_mnn_mnnllm_MnnNative_generate(
     }
 
     g_cancel.store(false);
+    g_llm->reset();
 
     char config[256];
     std::snprintf(
