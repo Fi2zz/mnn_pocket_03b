@@ -9,6 +9,7 @@
 #include <string>
 
 #include "llm/llm.hpp"
+#include "utf8.hpp"
 
 using MNN::Transformer::Llm;
 using MNN::Transformer::LlmContext;
@@ -30,6 +31,14 @@ std::string jstringToString(JNIEnv* env, jstring value) {
     std::string result(chars);
     env->ReleaseStringUTFChars(value, chars);
     return result;
+}
+
+jstring newStringFromUtf8(JNIEnv* env, const std::string& text) {
+    const std::u16string utf16 = mnn_bridge::utf8ToUtf16(text);
+    if (utf16.empty()) return env->NewStringUTF("");
+    return env->NewString(
+            reinterpret_cast<const jchar*>(utf16.data()),
+            static_cast<jsize>(utf16.size()));
 }
 
 void releaseModelLocked() {
@@ -79,6 +88,7 @@ RunResult runGeneration(
     }
 
     size_t lastLength = 0;
+    std::string pendingUtf8;
     if (!g_cancel.load()) {
         while (!g_llm->stoped() && ctx->gen_seq_len < maxTokens) {
             if (g_cancel.load()) break;
@@ -92,14 +102,34 @@ RunResult runGeneration(
             }
             if (current.size() <= lastLength) continue;
 
-            const std::string delta = current.substr(lastLength);
+            pendingUtf8.append(current, lastLength, current.size() - lastLength);
             lastLength = current.size();
-            jstring chunk = env->NewStringUTF(delta.c_str());
-            env->CallVoidMethod(tokenSink, onToken, chunk);
-            env->DeleteLocalRef(chunk);
+
+            const size_t complete = mnn_bridge::completeUtf8Length(pendingUtf8);
+            if (complete == 0) continue;
+
+            const std::string delta = pendingUtf8.substr(0, complete);
+            pendingUtf8.erase(0, complete);
+            jstring chunk = newStringFromUtf8(env, delta);
+            if (chunk != nullptr) {
+                env->CallVoidMethod(tokenSink, onToken, chunk);
+                env->DeleteLocalRef(chunk);
+            }
             if (env->ExceptionCheck()) {
                 env->ExceptionClear();
                 break;
+            }
+        }
+
+        // Flush an incomplete tail as U+FFFD rather than dropping it silently.
+        if (!pendingUtf8.empty() && tokenSink != nullptr && onToken != nullptr) {
+            jstring chunk = newStringFromUtf8(env, pendingUtf8);
+            if (chunk != nullptr) {
+                env->CallVoidMethod(tokenSink, onToken, chunk);
+                env->DeleteLocalRef(chunk);
+            }
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
             }
         }
     }
@@ -185,7 +215,7 @@ Java_com_example_mnn_mnnllm_MnnNative_generate(
             repeatPenalty,
             nullptr,
             nullptr);
-    return env->NewStringUTF(result.text.c_str());
+    return newStringFromUtf8(env, result.text);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
