@@ -58,4 +58,38 @@ void main() {
     expect(r.decodeMs, 2000.0);
     expect(r.decodeTokensPerSecond, 50.0);
   });
+
+  test('stream token event parses text', () {
+    final event = MnnStreamEvent.fromChannel({
+      'type': 'token',
+      'text': '你',
+    });
+    expect(event.type, MnnStreamEventType.token);
+    expect(event.text, '你');
+  });
+
+  test('stream done event parses stats and cancelled flag', () {
+    final event = MnnStreamEvent.fromChannel({
+      'type': 'done',
+      'cancelled': true,
+      'stats': {
+        'promptTokens': 10,
+        'decodeTokens': 20,
+        'prefillUs': 100000,
+        'decodeUs': 400000,
+      },
+    });
+    expect(event.type, MnnStreamEventType.done);
+    expect(event.cancelled, isTrue);
+    expect(event.stats['decodeTokens'], 20);
+  });
+
+  test('stream error event parses message', () {
+    final event = MnnStreamEvent.fromChannel({
+      'type': 'error',
+      'message': 'boom',
+    });
+    expect(event.type, MnnStreamEventType.error);
+    expect(event.message, 'boom');
+  });
 }

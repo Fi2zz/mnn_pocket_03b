@@ -19,6 +19,17 @@ class MnnNative {
         repeatPenalty: Float,
     ): String
 
+    /** Streams token deltas through [sink]; returns true when cancelled. */
+    external fun generateStream(
+        prompt: String,
+        temperature: Float,
+        topK: Int,
+        topP: Float,
+        maxTokens: Int,
+        repeatPenalty: Float,
+        sink: MnnTokenSink,
+    ): Boolean
+
     /** Returns [promptTokens, decodeTokens, prefillUs, decodeUs]. */
     external fun getLastStats(): LongArray
 

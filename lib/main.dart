@@ -103,6 +103,7 @@ class _Message {
   final String role; // 'user' | 'assistant'
   String text;
   String? meta;
+  bool streaming = false;
 }
 
 class _EvalCase {
@@ -184,6 +185,7 @@ class _ChatPageState extends State<ChatPage> {
   final TextEditingController _input = TextEditingController();
   final ScrollController _scroll = ScrollController();
   DateTime _lastProgress = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastStreamScroll = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   void initState() {
@@ -400,19 +402,31 @@ class _ChatPageState extends State<ChatPage> {
     _stopRequested = false;
     setState(() {
       _messages.add(_Message('user', text));
-      _messages.add(_Message('assistant', ''));
+      _messages.add(_Message('assistant', '')..streaming = true);
       _busy = true;
     });
     _scrollToBottom();
 
     final stopwatch = Stopwatch()..start();
     try {
-      final reply = await ai.chat(text, systemPrompt: systemPrompt);
+      final reply = await ai.chatStream(
+        text,
+        systemPrompt: systemPrompt,
+        onToken: (chunk) {
+          if (!mounted) return;
+          setState(() {
+            _messages.last.text += chunk;
+          });
+          _followStream();
+        },
+      );
       final clean = _clean(reply);
       stopwatch.stop();
       if (!mounted) return;
       setState(() {
-        _messages.last.text = clean.isEmpty ? '（模型没有返回内容）' : clean;
+        _messages.last
+          ..streaming = false
+          ..text = clean.isEmpty ? '（模型没有返回内容）' : clean;
         final meta = formatMetaLine(
           device: _deviceLabel,
           seconds: stopwatch.elapsedMilliseconds / 1000,
@@ -431,11 +445,18 @@ class _ChatPageState extends State<ChatPage> {
       stopwatch.stop();
       if (!mounted) return;
       setState(() {
-        _messages.last.text = '推理出错：$e';
-        _messages.last.meta = null;
+        _messages.last
+          ..streaming = false
+          ..text = '推理出错：$e'
+          ..meta = null;
       });
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _messages.last.streaming = false;
+        });
+      }
       _scrollToBottom();
     }
   }
@@ -1802,6 +1823,17 @@ class _ChatPageState extends State<ChatPage> {
     });
   }
 
+  /// Keep the newest token visible without animating on every 40 ms chunk.
+  void _followStream() {
+    final now = DateTime.now();
+    if (now.difference(_lastStreamScroll).inMilliseconds < 80) return;
+    _lastStreamScroll = now;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scroll.hasClients) return;
+      _scroll.jumpTo(_scroll.position.maxScrollExtent);
+    });
+  }
+
   @override
   void dispose() {
     _ai?.dispose();
@@ -2186,6 +2218,7 @@ class _Bubble extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     final isUser = message.role == 'user';
     final waiting = !isUser && message.text.isEmpty && isLast && busy;
+    final streaming = !isUser && message.streaming;
 
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
@@ -2240,6 +2273,15 @@ class _Bubble extends StatelessWidget {
                 style: TextStyle(
                   fontSize: 13,
                   color: scheme.onSurfaceVariant,
+                ),
+              )
+            else if (streaming)
+              Text(
+                '${message.text}▍',
+                style: TextStyle(
+                  fontSize: 15,
+                  height: 1.55,
+                  color: isUser ? scheme.onPrimary : scheme.onSurface,
                 ),
               )
             else

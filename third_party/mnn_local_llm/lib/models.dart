@@ -132,3 +132,60 @@ class MnnGenerationResult {
   double get decodeTokensPerSecond =>
       decodeMs > 0 ? decodeTokens / decodeMs * 1000 : 0;
 }
+
+enum MnnStreamEventType { token, done, error }
+
+/// One event from the native streaming generation channel.
+class MnnStreamEvent {
+  final MnnStreamEventType type;
+  final String text;
+  final String? message;
+  final Map<String, dynamic> stats;
+  final bool cancelled;
+
+  const MnnStreamEvent._({
+    required this.type,
+    this.text = '',
+    this.message,
+    this.stats = const {},
+    this.cancelled = false,
+  });
+
+  const MnnStreamEvent.token(String text)
+      : this._(type: MnnStreamEventType.token, text: text);
+
+  const MnnStreamEvent.done({
+    Map<String, dynamic> stats = const {},
+    bool cancelled = false,
+  }) : this._(
+          type: MnnStreamEventType.done,
+          stats: stats,
+          cancelled: cancelled,
+        );
+
+  const MnnStreamEvent.error(String message)
+      : this._(type: MnnStreamEventType.error, message: message);
+
+  factory MnnStreamEvent.fromChannel(Map<dynamic, dynamic> event) {
+    switch (event['type']) {
+      case 'token':
+        return MnnStreamEvent.token(event['text'] as String? ?? '');
+      case 'done':
+        final rawStats = event['stats'];
+        return MnnStreamEvent.done(
+          stats: rawStats is Map
+              ? Map<String, dynamic>.from(rawStats)
+              : const <String, dynamic>{},
+          cancelled: event['cancelled'] as bool? ?? false,
+        );
+      case 'error':
+        return MnnStreamEvent.error(
+          event['message'] as String? ?? 'MNN stream error',
+        );
+      default:
+        return MnnStreamEvent.error(
+          'Unknown MNN stream event: ${event['type']}',
+        );
+    }
+  }
+}

@@ -37,6 +37,93 @@ void releaseModelLocked() {
         g_llm.reset();
     }
 }
+
+struct RunResult {
+    std::string text;
+    bool cancelled = false;
+};
+
+RunResult runGeneration(
+        JNIEnv* env,
+        const std::string& prompt,
+        jfloat temperature,
+        jint topK,
+        jfloat topP,
+        jint maxTokens,
+        jfloat repeatPenalty,
+        jobject tokenSink,
+        jmethodID onToken) {
+    RunResult result;
+    g_cancel.store(false);
+    g_llm->reset();
+
+    char config[256];
+    std::snprintf(
+            config,
+            sizeof(config),
+            R"({"temperature":%.2f,"topK":%d,"topP":%.2f,"max_new_tokens":%d,"repetition_penalty":%.2f})",
+            temperature,
+            topK,
+            topP,
+            maxTokens,
+            repeatPenalty);
+    g_llm->set_config(config);
+
+    std::ostringstream os;
+    g_llm->response(prompt, &os, nullptr, 0);
+
+    const LlmContext* ctx = g_llm->getContext();
+    if (ctx == nullptr) {
+        LOGE("generate: missing context");
+        return result;
+    }
+
+    size_t lastLength = 0;
+    if (!g_cancel.load()) {
+        while (!g_llm->stoped() && ctx->gen_seq_len < maxTokens) {
+            if (g_cancel.load()) break;
+            g_llm->generate(1);
+
+            if (tokenSink == nullptr || onToken == nullptr) continue;
+            std::string current;
+            {
+                std::lock_guard<std::mutex> ctxLock(ctx->mutex);
+                current = ctx->generate_str;
+            }
+            if (current.size() <= lastLength) continue;
+
+            const std::string delta = current.substr(lastLength);
+            lastLength = current.size();
+            jstring chunk = env->NewStringUTF(delta.c_str());
+            env->CallVoidMethod(tokenSink, onToken, chunk);
+            env->DeleteLocalRef(chunk);
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                break;
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> ctxLock(ctx->mutex);
+        result.text = ctx->generate_str;
+    }
+    result.cancelled = g_cancel.load();
+
+    g_stats[0] = ctx->prompt_len;
+    g_stats[1] = ctx->gen_seq_len;
+    g_stats[2] = ctx->prefill_us;
+    g_stats[3] = ctx->decode_us;
+
+    LOGI("generate: prompt=%d decode=%d prefill=%.2fms decode=%.2fms chars=%zu%s",
+         ctx->prompt_len,
+         ctx->gen_seq_len,
+         ctx->prefill_us / 1000.0,
+         ctx->decode_us / 1000.0,
+         result.text.size(),
+         result.cancelled ? " (cancelled)" : "");
+    return result;
+}
 }  // namespace
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -88,57 +175,63 @@ Java_com_example_mnn_mnnllm_MnnNative_generate(
         return env->NewStringUTF("");
     }
 
-    g_cancel.store(false);
-    g_llm->reset();
-
-    char config[256];
-    std::snprintf(
-            config,
-            sizeof(config),
-            R"({"temperature":%.2f,"topK":%d,"topP":%.2f,"max_new_tokens":%d,"repetition_penalty":%.2f})",
+    const RunResult result = runGeneration(
+            env,
+            prompt,
             temperature,
             topK,
             topP,
             maxTokens,
-            repeatPenalty);
-    g_llm->set_config(config);
+            repeatPenalty,
+            nullptr,
+            nullptr);
+    return env->NewStringUTF(result.text.c_str());
+}
 
-    std::ostringstream os;
-    g_llm->response(prompt, &os, nullptr, 0);
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_mnn_mnnllm_MnnNative_generateStream(
+        JNIEnv* env,
+        jobject /*thiz*/,
+        jstring jPrompt,
+        jfloat temperature,
+        jint topK,
+        jfloat topP,
+        jint maxTokens,
+        jfloat repeatPenalty,
+        jobject tokenSink) {
+    const std::string prompt = jstringToString(env, jPrompt);
 
-    const LlmContext* ctx = g_llm->getContext();
-    if (ctx == nullptr) {
-        LOGE("generate: missing context");
-        return env->NewStringUTF("");
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_llm) {
+        LOGE("generateStream: model not loaded");
+        return JNI_TRUE;
     }
 
-    if (!g_cancel.load()) {
-        while (!g_llm->stoped() && ctx->gen_seq_len < maxTokens) {
-            if (g_cancel.load()) break;
-            g_llm->generate(1);
-        }
+    jclass sinkClass = env->GetObjectClass(tokenSink);
+    if (sinkClass == nullptr) {
+        LOGE("generateStream: missing token sink class");
+        return JNI_TRUE;
+    }
+    jmethodID onToken =
+            env->GetMethodID(sinkClass, "onToken", "(Ljava/lang/String;)V");
+    if (onToken == nullptr) {
+        LOGE("generateStream: missing onToken method");
+        env->DeleteLocalRef(sinkClass);
+        return JNI_TRUE;
     }
 
-    std::string text;
-    {
-        std::lock_guard<std::mutex> ctxLock(ctx->mutex);
-        text = ctx->generate_str;
-    }
-
-    g_stats[0] = ctx->prompt_len;
-    g_stats[1] = ctx->gen_seq_len;
-    g_stats[2] = ctx->prefill_us;
-    g_stats[3] = ctx->decode_us;
-
-    LOGI("generate: prompt=%d decode=%d prefill=%.2fms decode=%.2fms chars=%zu%s",
-         ctx->prompt_len,
-         ctx->gen_seq_len,
-         ctx->prefill_us / 1000.0,
-         ctx->decode_us / 1000.0,
-         text.size(),
-         g_cancel.load() ? " (cancelled)" : "");
-
-    return env->NewStringUTF(text.c_str());
+    const RunResult result = runGeneration(
+            env,
+            prompt,
+            temperature,
+            topK,
+            topP,
+            maxTokens,
+            repeatPenalty,
+            tokenSink,
+            onToken);
+    env->DeleteLocalRef(sinkClass);
+    return result.cancelled ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jlongArray JNICALL

@@ -10,6 +10,7 @@ LLM 后端是 **MNN runtime**：`libMNN.so` 同时包含 MNN 引擎和 LLM engin
 
 - **纯本地推理**：模型、语音、对话数据都不出设备，无 API Key、无网络请求
 - **流式语音输入**：按住说话，松手自动发送；INT8 量化 ASR，边说边出字
+- **流式文本生成**：token 分批上屏，末尾显示光标；生成中可随时打断
 - **可打断**：生成中右下角按钮变为停止，点击后保留已生成的部分回答
 - **设备感知指标**：每条回答下方显示 SoC、内存、耗时、字数、decode tok/s，以及完整生成参数
 - **单页聊天**：没有底部 Tab，只有对话；输入框支持“文本 / 按住说话”两种模式
@@ -44,7 +45,7 @@ LLM 后端是 **MNN runtime**：`libMNN.so` 同时包含 MNN 引擎和 LLM engin
 - 语音模式：显示「按住说话」，按住开始流式识别，松手自动发送
 - 右下角按钮：文本模式时是麦克风，语音模式时是键盘；生成中变成红色停止按钮
 - 右上角：关于、生成参数、清空对话
-- 生成中显示「正在本地推理…」，完成后整段回答一次上屏（当前版本不做逐 token 流式）
+- 生成中先显示「正在本地推理…」，第一个 token 到达后逐字上屏，末尾显示 `▍`；完成后切换为 Markdown 渲染
 
 ## 技术架构
 
@@ -54,17 +55,19 @@ LLM 后端是 **MNN runtime**：`libMNN.so` 同时包含 MNN 引擎和 LLM engin
 │                  lib/main.dart               │
 ├───────────────────────┬──────────────────────┤
 │   mnn_local_llm       │     sherpa_onnx      │
-│   Dart → MethodChannel│     Dart FFI         │
-│        ↓              │        ↓             │
-│   Kotlin Plugin       │   X-ASR INT8 + VAD   │
-│        ↓ JNI          │   16 kHz 流式解码     │
+│ MethodChannel +       │     Dart FFI         │
+│ EventChannel          │        ↓             │
+│        ↓              │   X-ASR INT8 + VAD   │
+│   Kotlin Plugin       │   16 kHz 流式解码     │
+│        ↓ JNI          │                      │
 │   libMNN.so           │                      │
 │   (MNN + LLM engine)  │                      │
 └───────────────────────┴──────────────────────┘
 ```
 
 - LLM：`third_party/mnn_local_llm`，JNI bridge 链接预编译 `libMNN.so`
-- 取消生成：`std::atomic<bool>` + 逐 token `generate(1)` 循环，命中后返回已生成文本
+- 流式输出：`startGenerate` 启动生成，EventChannel 推送 token；Kotlin 每 40 ms 批量 flush，Dart 侧逐字追加
+- **取消生成**：`std::atomic<bool>` + 逐 token `generate(1)` 循环，命中后返回已生成文本
 - 采样：`temperature`、`topK`、`topP`、`repetition_penalty` 通过 MNN `set_config` 写入
 - ASR：sherpa-onnx 的 `OnlineRecognizer`（Zipformer2 transducer，`greedy_search`）
 - VAD：Silero VAD，用于判断说话起止和端点
@@ -334,7 +337,6 @@ Debug APK 约 157 MB，包含 Flutter debug 产物、sherpa-onnx 和 MNN 原生�
 ## 已知限制
 
 - 仅 Android arm64-v8a，不支持模拟器和 x86
-- 无 LLM 流式输出，回答在生成结束后一次上屏
 - 无对话持久化，杀进程后历史丢失
 - ASR 只有中英文，且依赖外部模型文件
 - 不保留 llama.cpp 后端，无法在 App 内切换引擎

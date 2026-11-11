@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -108,6 +109,82 @@ class MnnLlm {
     final stats = rawStats is Map ? rawStats : const <dynamic, dynamic>{};
     lastResult = MnnGenerationResult.fromChannel(text, stats);
     return text;
+  }
+
+  /// Like [chat], but forwards each native token chunk through [onToken].
+  Future<String> chatStream(
+    String message, {
+    String? systemPrompt,
+    void Function(String chunk)? onToken,
+  }) async {
+    if (!_ready) throw StateError('Call initialize() first');
+    _systemPrompt = systemPrompt ?? _systemPrompt;
+
+    _history.add((role: 'user', text: message));
+    final prompt = model.chatTemplate.format(
+      systemPrompt: _systemPrompt,
+      messages: _history,
+    );
+
+    final buffer = StringBuffer();
+    final completer = Completer<void>();
+    String? error;
+    var cancelled = false;
+
+    late final StreamSubscription<MnnStreamEvent> subscription;
+    subscription = MnnLocalLlmPlatform.instance.stream.listen(
+      (event) {
+        switch (event.type) {
+          case MnnStreamEventType.token:
+            buffer.write(event.text);
+            onToken?.call(event.text);
+            break;
+          case MnnStreamEventType.done:
+            lastResult = MnnGenerationResult.fromChannel(
+              buffer.toString(),
+              event.stats,
+            );
+            cancelled = event.cancelled;
+            if (!completer.isCompleted) completer.complete();
+            break;
+          case MnnStreamEventType.error:
+            error = event.message ?? 'MNN stream error';
+            if (!completer.isCompleted) completer.complete();
+            break;
+        }
+      },
+      onError: (Object e) {
+        error = '$e';
+        if (!completer.isCompleted) completer.complete();
+      },
+      onDone: () {
+        if (!completer.isCompleted) {
+          error ??= 'MNN stream closed';
+          completer.complete();
+        }
+      },
+    );
+
+    try {
+      final started = await MnnLocalLlmPlatform.instance.startGenerate(
+        prompt,
+        settings.toMap(),
+      );
+      if (started != true) {
+        throw Exception('Failed to start MNN generation');
+      }
+      await completer.future;
+    } finally {
+      await subscription.cancel();
+    }
+
+    if (error != null) throw Exception(error);
+    final reply = buffer.toString().trim();
+    if (reply.isEmpty && !cancelled) {
+      throw Exception('MNN generation failed');
+    }
+    _history.add((role: 'assistant', text: reply));
+    return reply;
   }
 
   Future<void> cancelGenerate() async {

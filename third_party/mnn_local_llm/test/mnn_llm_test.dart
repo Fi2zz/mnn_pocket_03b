@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -31,6 +32,20 @@ class _FakePlatform extends MnnLocalLlmPlatform {
   bool returnNull = false;
   bool throwOnFirstLoad = false;
   int loadCalls = 0;
+  final controller = StreamController<MnnStreamEvent>.broadcast();
+
+  @override
+  Stream<MnnStreamEvent> get stream => controller.stream;
+
+  @override
+  Future<bool?> startGenerate(
+    String prompt,
+    Map<String, dynamic> settings,
+  ) async {
+    lastPrompt = prompt;
+    lastSettings = settings;
+    return true;
+  }
 
   @override
   Future<bool?> loadModel(String dir) async {
@@ -91,6 +106,7 @@ void main() {
   });
 
   tearDown(() async {
+    await platform.controller.close();
     if (await tmp.exists()) await tmp.delete(recursive: true);
   });
 
@@ -168,5 +184,57 @@ void main() {
       await File('${tmp.path}/models/${_model.dirName}/a.json').exists(),
       isTrue,
     );
+  });
+
+  test('chatStream forwards chunks and records final stats', () async {
+    await ai.initialize();
+    final chunks = <String>[];
+
+    final future = ai.chatStream(
+      'hi',
+      systemPrompt: 'sys',
+      onToken: chunks.add,
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    platform.controller.add(const MnnStreamEvent.token('hel'));
+    platform.controller.add(const MnnStreamEvent.token('lo'));
+    platform.controller.add(const MnnStreamEvent.done(stats: {
+      'promptTokens': 10,
+      'decodeTokens': 20,
+      'prefillUs': 100000,
+      'decodeUs': 400000,
+    }));
+
+    final reply = await future;
+
+    expect(reply, 'hello');
+    expect(chunks.join(), 'hello');
+    expect(ai.lastResult!.decodeTokensPerSecond, 50.0);
+    expect(platform.lastPrompt, contains('hi'));
+  });
+
+  test('chatStream surfaces error events', () async {
+    await ai.initialize();
+    final future = ai.chatStream('hi', systemPrompt: 'sys');
+    await Future<void>.delayed(Duration.zero);
+
+    platform.controller.add(const MnnStreamEvent.token('par'));
+    platform.controller.add(const MnnStreamEvent.error('boom'));
+
+    await expectLater(future, throwsA(isA<Exception>()));
+  });
+
+  test('chatStream returns partial text when cancelled', () async {
+    await ai.initialize();
+    final future = ai.chatStream('hi', systemPrompt: 'sys');
+    await Future<void>.delayed(Duration.zero);
+
+    platform.controller.add(const MnnStreamEvent.token('par'));
+    platform.controller.add(
+      const MnnStreamEvent.done(cancelled: true),
+    );
+
+    expect(await future, 'par');
   });
 }
